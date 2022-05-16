@@ -5,8 +5,6 @@ import (
 	"expvar"
 	"fmt"
 	"movie-api/internal/data"
-	"movie-api/internal/validator"
-	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,6 +12,8 @@ import (
 	"time"
 
 	"github.com/felixge/httpsnoop"
+	"github.com/pascaldekloe/jwt"
+	"github.com/tomasen/realip"
 	"golang.org/x/time/rate"
 )
 
@@ -56,12 +56,7 @@ func (app *application) rateLimit(next http.Handler) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if app.config.limiter.enabled {
-			ip, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				app.serverErrorResponse(w, r, err)
-				return
-			}
-
+			ip := realip.FromRequest(r)
 			mu.Lock()
 			if _, found := clients[ip]; !found {
 				clients[ip] = &client{limiter: rate.NewLimiter(rate.Limit(app.config.limiter.rps), app.config.limiter.burst)}
@@ -97,13 +92,38 @@ func (app *application) authenticate(next http.Handler) http.Handler {
 		}
 
 		token := headerParts[1]
-		v := validator.New()
-		if data.ValidateTokenPlaintext(v, token); !v.Valid() {
+
+		claims, err := jwt.HMACCheck([]byte(token), []byte(app.config.jwt.secret))
+		if err != nil {
 			app.invalidAuthenticationTokenResponse(w, r)
 			return
 		}
 
-		user, err := app.models.Users.GetForToken(data.ScopeAuthentication, token)
+		if !claims.Valid(time.Now()) {
+			fmt.Println("claims.Valid")
+			app.invalidAuthenticationTokenResponse(w, r)
+			return
+		}
+
+		if claims.Issuer != "greenlight.movies.com" {
+			fmt.Println("claims.Issuer")
+			app.invalidAuthenticationTokenResponse(w, r)
+			return
+		}
+
+		if !claims.AcceptAudience("greenlight.movies.com") {
+			fmt.Println("claims.AcceptAudience")
+			app.invalidAuthenticationTokenResponse(w, r)
+			return
+		}
+
+		userID, err := strconv.ParseInt(claims.Subject, 10, 64)
+		if err != nil {
+			app.serverErrorResponse(w, r, err)
+			return
+		}
+
+		user, err := app.models.Users.Get(userID)
 		if err != nil {
 			switch {
 			case errors.Is(err, data.ErrRecordNotFound):
